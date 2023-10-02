@@ -369,6 +369,15 @@ static cl::opt<uint64_t>
                     cl::desc("offset of asan shadow mapping [EXPERIMENTAL]"),
                     cl::Hidden, cl::init(0));
 
+static cl::opt<uint64_t>
+    ClMappingMin("asan-mapping-min",
+                    cl::desc("Do not do shadow memory checks for pointers below this address"),
+                    cl::Hidden, cl::init(0));
+static cl::opt<uint64_t>
+    ClMappingMax("asan-mapping-max",
+                    cl::desc("Do not do shadow memory checks for pointers above this address"),
+                    cl::Hidden, cl::init(0));
+
 // Optimization flags. Not user visible, used mostly for testing
 // and benchmarking the tool.
 
@@ -467,6 +476,8 @@ namespace {
 struct ShadowMapping {
   int Scale;
   uint64_t Offset;
+  std::optional<uint64_t> Min;
+  std::optional<uint64_t> Max;
   bool OrShadowOffset;
   bool InGlobal;
 };
@@ -584,6 +595,14 @@ static ShadowMapping getShadowMapping(const Triple &TargetTriple, int LongSize,
     Mapping.Offset = ClMappingOffset;
   }
 
+  if (ClMappingMin.getNumOccurrences() > 0) {
+    Mapping.Min = ClMappingMin;
+  }
+
+  if (ClMappingMax.getNumOccurrences() > 0) {
+    Mapping.Max = ClMappingMax;
+  }
+
   // OR-ing shadow offset if more efficient (at least on x86) if the offset
   // is a power of two, but on ppc64 and loongarch64 we have to use add since
   // the shadow offset is not necessarily 1/8-th of the address space.  On
@@ -692,6 +711,8 @@ struct AddressSanitizer {
                                        Instruction *InsertBefore, Value *Addr,
                                        uint32_t TypeStoreSize, bool IsWrite,
                                        Value *SizeArgument);
+  Instruction *instrumentBareMetalAddress(Instruction *InsertBefore,
+                                          Value *Addr);
   void instrumentUnusualSizeOrAlignment(Instruction *I,
                                         Instruction *InsertBefore, Value *Addr,
                                         TypeSize TypeStoreSize, bool IsWrite,
@@ -1707,6 +1728,34 @@ Instruction *AddressSanitizer::instrumentAMDGPUAddress(
   return InsertBefore;
 }
 
+Instruction *
+AddressSanitizer::instrumentBareMetalAddress(Instruction *InsertBefore,
+                                             Value *Addr) {
+  if (Mapping.Min) {
+    // Insert a cmp+br to skip sanitising low addresses, such as ROM.
+    Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+    IRBuilder<> IRB(InsertBefore);
+    Value *AddrInt = IRB.CreatePtrToInt(Addr, IntptrTy);
+    Value *Cmp =
+        IRB.CreateICmpUGE(AddrInt, ConstantInt::get(IntptrTy, *Mapping.Min));
+    Value *SkipLanding = SplitBlockAndInsertIfThen(Cmp, InsertBefore, false);
+    InsertBefore = cast<Instruction>(SkipLanding);
+  }
+
+  if (Mapping.Max) {
+    // Insert a cmp+br to skip sanitising high addresses, such as device memory.
+    Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+    IRBuilder<> IRB(InsertBefore);
+    Value *AddrInt = IRB.CreatePtrToInt(Addr, IntptrTy);
+    Value *Cmp =
+        IRB.CreateICmpULT(AddrInt, ConstantInt::get(IntptrTy, *Mapping.Max));
+    Value *SkipLanding = SplitBlockAndInsertIfThen(Cmp, InsertBefore, false);
+    InsertBefore = cast<Instruction>(SkipLanding);
+  }
+
+  return InsertBefore;
+}
+
 void AddressSanitizer::instrumentAddress(Instruction *OrigIns,
                                          Instruction *InsertBefore, Value *Addr,
                                          MaybeAlign Alignment,
@@ -1719,6 +1768,8 @@ void AddressSanitizer::instrumentAddress(Instruction *OrigIns,
     if (!InsertBefore)
       return;
   }
+
+  InsertBefore = instrumentBareMetalAddress(InsertBefore, Addr);
 
   InstrumentationIRBuilder IRB(InsertBefore);
   size_t AccessSizeIndex = TypeStoreSizeToSizeIndex(TypeStoreSize);

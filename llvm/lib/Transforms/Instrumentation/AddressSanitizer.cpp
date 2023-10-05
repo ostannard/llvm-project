@@ -1269,19 +1269,28 @@ static bool isUnsupportedAMDGPUAddrspace(Value *Addr) {
 }
 
 Value *AddressSanitizer::memToShadow(Value *Shadow, IRBuilder<> &IRB) {
-  // Shadow >> scale
-  Shadow = IRB.CreateLShr(Shadow, Mapping.Scale);
-  if (Mapping.Offset == 0) return Shadow;
-  // (Shadow >> scale) | offset
   Value *ShadowBase;
   if (LocalDynamicShadow)
     ShadowBase = LocalDynamicShadow;
   else
     ShadowBase = ConstantInt::get(IntptrTy, Mapping.Offset);
-  if (Mapping.OrShadowOffset)
-    return IRB.CreateOr(Shadow, ShadowBase);
-  else
+
+  if (ClSplitShadow) {
+    Value *TopBits = IRB.CreateAnd(Shadow, ConstantInt::get(IntptrTy, 0xf0000000));
+    Value *BottomBits = IRB.CreateAnd(Shadow, ConstantInt::get(IntptrTy, 0x0fffffff));
+    BottomBits = IRB.CreateLShr(BottomBits, Mapping.Scale);
+    Shadow = IRB.CreateOr(TopBits, BottomBits);
     return IRB.CreateAdd(Shadow, ShadowBase);
+  } else {
+    // Shadow >> scale
+    Shadow = IRB.CreateLShr(Shadow, Mapping.Scale);
+    if (Mapping.Offset == 0) return Shadow;
+    // (Shadow >> scale) | offset
+    if (Mapping.OrShadowOffset)
+      return IRB.CreateOr(Shadow, ShadowBase);
+    else
+      return IRB.CreateAdd(Shadow, ShadowBase);
+  }
 }
 
 // Instrument memset/memmove/memcpy
@@ -1767,7 +1776,6 @@ AddressSanitizer::instrumentBareMetalAddress(Instruction *InsertBefore,
                                              Value *Addr) {
   if (Mapping.Min) {
     // Insert a cmp+br to skip sanitising low addresses, such as ROM.
-    Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
     IRBuilder<> IRB(InsertBefore);
     Value *AddrInt = IRB.CreatePtrToInt(Addr, IntptrTy);
     Value *Cmp =
@@ -1778,7 +1786,6 @@ AddressSanitizer::instrumentBareMetalAddress(Instruction *InsertBefore,
 
   if (Mapping.Max) {
     // Insert a cmp+br to skip sanitising high addresses, such as device memory.
-    Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
     IRBuilder<> IRB(InsertBefore);
     Value *AddrInt = IRB.CreatePtrToInt(Addr, IntptrTy);
     Value *Cmp =

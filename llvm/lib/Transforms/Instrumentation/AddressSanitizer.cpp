@@ -126,6 +126,7 @@ static const size_t kMinStackMallocSize = 1 << 6;   // 64B
 static const size_t kMaxStackMallocSize = 1 << 16;  // 64K
 static const uintptr_t kCurrentStackFrameMagic = 0x41B58AB3;
 static const uintptr_t kRetiredStackFrameMagic = 0x45E0360E;
+const int kAsanGlobalRedzoneMagic = 0xf9;
 
 const char kAsanModuleCtorName[] = "asan.module_ctor";
 const char kAsanModuleDtorName[] = "asan.module_dtor";
@@ -477,6 +478,11 @@ static cl::opt<bool> ClIgnoreConstGlobals(
 static cl::opt<bool> ClSmallGlobalMetadata(
     "asan-small-global-metadata",
     cl::desc("Emit less metadata for global variables"),
+    cl::init(false));
+
+static cl::opt<bool> ClCreateGlobalShadow(
+    "asan-create-global-shadow",
+    cl::desc("Create shadow memory for global variables/constants at compile time"),
     cl::init(false));
 
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
@@ -872,6 +878,11 @@ private:
   void InstrumentGlobalsArmlink(IRBuilder<> &IRB, Module &M,
                                 ArrayRef<GlobalVariable *> ExtendedGlobals,
                                 ArrayRef<Constant *> MetadataInitializers);
+  void InstrumentGlobalsStatic(IRBuilder<> &IRB, Module &M,
+                                ArrayRef<GlobalVariable *> ExtendedGlobals,
+                                ArrayRef<Constant *> ShadowInitializers);
+  Constant *createShadowForGlobal(uint64_t ValidSize,
+                                  uint64_t RedzoneSize) const;
   void InstrumentGlobalsMachO(IRBuilder<> &IRB, Module &M,
                               ArrayRef<GlobalVariable *> ExtendedGlobals,
                               ArrayRef<Constant *> MetadataInitializers);
@@ -2344,6 +2355,33 @@ void ModuleAddressSanitizer::InstrumentGlobalsArmlink(
     appendToCompilerUsed(M, MetadataGlobals);
 }
 
+void ModuleAddressSanitizer::InstrumentGlobalsStatic(
+    IRBuilder<> &IRB, Module &M, ArrayRef<GlobalVariable *> ExtendedGlobals,
+    ArrayRef<Constant *> ShadowInitializers) {
+  assert(ExtendedGlobals.size() == ShadowInitializers.size());
+
+  SmallVector<GlobalValue *, 16> GlobalShadows(ExtendedGlobals.size());
+  for (size_t i = 0; i < ExtendedGlobals.size(); ++i) {
+    Constant *ShadowInitializer = ShadowInitializers[i];
+    GlobalVariable *G = ExtendedGlobals[i];
+
+    GlobalVariable *ShadowGV = new GlobalVariable(
+        M, ShadowInitializer->getType(), true /*isConstant*/,
+        GlobalVariable::PrivateLinkage, ShadowInitializer,
+        Twine("__asan_global_shadow_") +
+            GlobalValue::dropLLVMManglingEscape(G->getName()));
+    MDNode *MD = MDNode::get(M.getContext(), ValueAsMetadata::get(G));
+    ShadowGV->setMetadata(LLVMContext::MD_associated, MD);
+    ShadowGV->setSection("__shadow");
+    GlobalShadows[i] = ShadowGV;
+  }
+  
+  // Update llvm.compiler.used, adding the new global shadows. This is needed
+  // so that during LTO these variables stay alive.
+  if (!GlobalShadows.empty())
+    appendToCompilerUsed(M, GlobalShadows);
+}
+
 void ModuleAddressSanitizer::InstrumentGlobalsMachO(
     IRBuilder<> &IRB, Module &M, ArrayRef<GlobalVariable *> ExtendedGlobals,
     ArrayRef<Constant *> MetadataInitializers) {
@@ -2436,6 +2474,17 @@ void ModuleAddressSanitizer::InstrumentGlobalsWithMetadataArray(
   }
 }
 
+Constant *
+ModuleAddressSanitizer::createShadowForGlobal(uint64_t ValidSize,
+                                              uint64_t RedzoneSize) const {
+  uint64_t Granularity = 1ULL << Mapping.Scale;
+  SmallVector<uint8_t, 16> Shadow(ValidSize / Granularity, 0);
+  if (ValidSize % Granularity)
+    Shadow.push_back(ValidSize % Granularity);
+  Shadow.resize((ValidSize + RedzoneSize) / Granularity, kAsanGlobalRedzoneMagic);
+  return ConstantDataArray::get(*C, ArrayRef(Shadow));
+}
+
 // This function replaces all global variables with new variables that have
 // trailing redzones. It also creates a function that poisons
 // redzones and inserts this function into llvm.global_ctors.
@@ -2480,6 +2529,7 @@ void ModuleAddressSanitizer::instrumentGlobals(IRBuilder<> &IRB, Module &M,
                                      IntptrTy, IntptrTy, IntptrTy, IntptrTy);
   SmallVector<GlobalVariable *, 16> NewGlobals(n);
   SmallVector<Constant *, 16> Initializers(n);
+  SmallVector<Constant *, 16> Shadows(n);
 
   bool HasDynamicallyInitializedGlobals = false;
 
@@ -2609,6 +2659,7 @@ void ModuleAddressSanitizer::instrumentGlobals(IRBuilder<> &IRB, Module &M,
     LLVM_DEBUG(dbgs() << "NEW GLOBAL: " << *NewGlobal << "\n");
 
     Initializers[i] = Initializer;
+    Shadows[i] = createShadowForGlobal(SizeInBytes, RightRedzoneSize);
   }
 
   // Add instrumented globals to llvm.compiler.used list to avoid LTO from
@@ -2625,7 +2676,9 @@ void ModuleAddressSanitizer::instrumentGlobals(IRBuilder<> &IRB, Module &M,
       (UseGlobalsGC && TargetTriple.isOSBinFormatELF()) ? getUniqueModuleId(&M)
                                                         : "";
 
-  if (ClGlobalsArmlink) {
+  if (ClCreateGlobalShadow) {
+    InstrumentGlobalsStatic(IRB, M, NewGlobals, Shadows);
+  } else if (ClGlobalsArmlink) {
     InstrumentGlobalsArmlink(IRB, M, NewGlobals, Initializers);
   if (UseGlobalsGC && TargetTriple.isOSBinFormatELF()) {
     // Use COMDAT and register globals even if n == 0 to ensure that (a) the

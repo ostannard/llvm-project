@@ -2379,7 +2379,14 @@ void ModuleAddressSanitizer::InstrumentGlobalsStatic(
             GlobalValue::dropLLVMManglingEscape(G->getName()));
     MDNode *MD = MDNode::get(M.getContext(), ValueAsMetadata::get(G));
     ShadowGV->setMetadata(LLVMContext::MD_associated, MD);
-    ShadowGV->setSection("__shadow");
+    // FIXME Later optimisationa might turn a non-constant into a constant, so
+    // these names will be wrong. It would be better to figure out a way to
+    // place these correctly in the scatter file, or allow the armlink
+    // shadow-fixup phase to move these sections between shadow ERs.
+    if (G->isConstant())
+      ShadowGV->setSection("__shadow_ro");
+    else
+      ShadowGV->setSection("__shadow_rw");
     GlobalShadows[i] = ShadowGV;
   }
   

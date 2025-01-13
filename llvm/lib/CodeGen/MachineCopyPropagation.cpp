@@ -116,6 +116,26 @@ class CopyTracker {
   };
 
   DenseMap<MCRegUnit, CopyInfo> Copies;
+  DenseMap<const uint32_t *, BitVector> RegMaskToPreservedRegUnits;
+
+  BitVector &getPreservedRegUnits(const MachineOperand &RegMaskOp,
+                                  const TargetRegisterInfo &TRI) {
+    const uint32_t *RegMask = RegMaskOp.getRegMask();
+    auto Existing = RegMaskToPreservedRegUnits.find(RegMask);
+    if (Existing != RegMaskToPreservedRegUnits.end()) {
+      return Existing->second;
+    } else {
+      BitVector &PreservedRegUnits = RegMaskToPreservedRegUnits[RegMask];
+
+      PreservedRegUnits.resize(TRI.getNumRegUnits());
+      for (unsigned SafeReg = 0, E = TRI.getNumRegs(); SafeReg < E; ++SafeReg)
+        if (!RegMaskOp.clobbersPhysReg(SafeReg))
+          for (auto SafeUnit : TRI.regunits(SafeReg))
+            PreservedRegUnits.set(SafeUnit);
+
+      return PreservedRegUnits;
+    }
+  }
 
 public:
   /// Mark all of the given registers and their subregisters as unavailable for
@@ -237,12 +257,7 @@ public:
                                   const TargetRegisterInfo &TRI,
                                   const TargetInstrInfo &TII,
                                   bool UseCopyInstr) {
-    BitVector SafeRegUnits(TRI.getNumRegUnits());
-
-    for (unsigned SafeReg = 0, E = TRI.getNumRegs(); SafeReg < E; ++SafeReg)
-      if (!RegMask->clobbersPhysReg(SafeReg))
-        for (auto SafeUnit : TRI.regunits(SafeReg))
-          SafeRegUnits.set(SafeUnit);
+    BitVector &SafeRegUnits = getPreservedRegUnits(*RegMask, TRI);
 
     for (unsigned Unit = 0, E = TRI.getNumRegUnits(); Unit < E; ++Unit)
       if (!SafeRegUnits.test(Unit))

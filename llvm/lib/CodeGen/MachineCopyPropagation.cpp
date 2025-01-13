@@ -118,6 +118,7 @@ class CopyTracker {
   DenseMap<MCRegUnit, CopyInfo> Copies;
   DenseMap<const uint32_t *, BitVector> RegMaskToPreservedRegUnits;
 
+public:
   BitVector &getPreservedRegUnits(const MachineOperand &RegMaskOp,
                                   const TargetRegisterInfo &TRI) {
     const uint32_t *RegMask = RegMaskOp.getRegMask();
@@ -137,7 +138,6 @@ class CopyTracker {
     }
   }
 
-public:
   /// Mark all of the given registers and their subregisters as unavailable for
   /// copying.
   void markRegsUnavailable(ArrayRef<MCRegister> Regs,
@@ -999,9 +999,8 @@ void MachineCopyPropagation::ForwardCopyPropagateBlock(MachineBasicBlock &MBB) {
     // a large set of registers.  Treat clobbered registers the same way as
     // defined registers.
     if (RegMask) {
-      // Invalidate all entries in the copy map which are not preserved by this
-      // register mask.
-      Tracker.clobberRegistersExceptMask(RegMask, *TRI, *TII, UseCopyInstr);
+      BitVector &PreservedRegUnits =
+          Tracker.getPreservedRegUnits(*RegMask, *TRI);
 
       // Erase any MaybeDeadCopies whose destination register is clobbered.
       for (SmallSetVector<MachineInstr *, 8>::iterator DI =
@@ -1020,6 +1019,12 @@ void MachineCopyPropagation::ForwardCopyPropagateBlock(MachineBasicBlock &MBB) {
 
         LLVM_DEBUG(dbgs() << "MCP: Removing copy due to regmask clobbering: ";
                    MaybeDead->dump());
+
+        // Invalidate all entries in the copy map which are not preserved by
+        // this register mask.
+        for (unsigned RegUnit : TRI->regunits(Reg))
+          if (!PreservedRegUnits.test(RegUnit))
+            Tracker.clobberRegUnit(RegUnit, *TRI, *TII, UseCopyInstr);
 
         // erase() will return the next valid iterator pointing to the next
         // element after the erased one.
